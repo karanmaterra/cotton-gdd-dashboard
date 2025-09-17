@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#4CAF50"  # Green theme for agriculture
+backgroundColor = "#F5F6F5"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1A3C34"
+
+[server]
+maxUploadSize = 200  # MB, optional if you add file uploads later
+
+[ui]
+hideTopBar = false
+hideSidebarNav = false
