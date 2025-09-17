@@ -191,7 +191,7 @@ st.markdown('<h1 class="main-header">🌱 Real time cotton crop status(Based on 
 # Sidebar for user inputs
 st.sidebar.markdown('<h2 class="sidebar-header">📊 Analysis Parameters</h2>', unsafe_allow_html=True)
 farmer_id = st.sidebar.text_input("Farmer ID", value="10811", placeholder="e.g., 10811", help="Enter the unique farmer identification number")
-question_date = st.sidebar.date_input("Question Date", value=date(2025, 9, 17), help="Select the date for analysis")  # Updated to today's date
+question_date = st.sidebar.date_input("Question Date", value=date(2025, 8, 26), help="Select the date for analysis")
 get_result = st.sidebar.button("🔍 Run Analysis", type="primary")
 
 # Function to validate inputs

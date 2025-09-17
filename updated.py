@@ -1,30 +1,77 @@
-import psycopg2
-import logging
-import pandas as pd
-import sqlalchemy
-import numpy as np
-import argparse
-import datetime
-from datetime import datetime, timedelta
 import os
+import pandas as pd
+import logging
+import argparse
+from urllib.parse import quote_plus
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 
-# --- Database Setup ---
-def setup_database():
+load_dotenv()  # loads .env into os.environ (no-op if .env not present)
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
+
+def get_db_url() -> str | None:
+    """
+    Return DB URL from DB_URL or build from DB_USER/DB_PASS/DB_HOST/DB_PORT/DB_NAME.
+    If password contains special chars it URL-encodes it.
+    """
+    db_url = os.getenv("DB_URL")
+    if db_url:
+        return db_url
+
+    # fallback to components (useful if you prefer separate env vars)
+    user = os.getenv("DB_USER")
+    pwd = os.getenv("DB_PASS")
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME")
+    driver = os.getenv("DB_DRIVER", "postgresql+psycopg2")
+
+    if not (user and pwd and name):
+        logging.error("DB_URL not set and/or DB_USER/DB_PASS/DB_NAME are missing.")
+        return None
+
+    pwd_quoted = quote_plus(pwd)  # encodes special chars in password
+    return f"{driver}://{user}:{pwd_quoted}@{host}:{port}/{name}"
+
+
+def mask_db_url(url: str) -> str:
+    """Return a safe-to-log version of a DB URL with password masked."""
     try:
-        # Use environment variable for DB URL (secure for deployment)
-        db_url = os.getenv('DB_URL', 'postgresql+psycopg2://postgres:password@localhost/gddmodel')
-        engine = sqlalchemy.create_engine(db_url)
-        with engine.connect() as conn:
-            logging.info("Database initialized successfully.")
-        return engine
-    except Exception as e:
-        logging.error(f"Database initialization failed: {e}")
-        raise  # Re-raise to let calling code handle it
+        u = make_url(url)
+        user = u.username or "?"
+        host = u.host or "?"
+        port = u.port or "?"
+        database = u.database or "?"
+        driver = u.drivername or "?"
+        return f"{driver}://{user}:***@{host}:{port}/{database}"
+    except Exception:
+        # fallback if parsing fails
+        return "masked_db_url"
 
+
+def setup_database() -> Engine:
+    db_url = get_db_url()
+    if not db_url:
+        logging.error("No DB URL available. Set DB_URL or DB_USER/DB_PASS/DB_NAME in env.")
+        raise SystemExit(1)
+
+    logging.debug(f"Connecting using: {mask_db_url(db_url)}")
+    try:
+        engine = create_engine(db_url, pool_pre_ping=True)
+        # quick test connection
+        with engine.connect() as conn:
+            logging.info("Database connected successfully.")
+        return engine
+    except SQLAlchemyError as e:
+        logging.error(f"Database connection failed: {e}")
+        raise SystemExit(1)
 # --- Cotton Phenophase Thresholds ---
 phenophase_thresholds = {
     "May 20–23": {'P1': (69, 73), 'P2': (259, 279), 'P3': (316, 351), 'P4': (502, 550), 'P5': (609, 665), 'P6': (883, 962), 'P7': (1004, 1115), 'P8': (1202, 1298), 'P9': (1294, 1375), 'P10': (1369, 1502)},
@@ -314,7 +361,6 @@ def evaluate_insect_risks(weather_row, phenophase, date):
                     "risk_percentage": risk_percentage,
                     "advisory": insect["advisory"]
                 })
-
         return alerts
     except Exception as e:
         logging.error(f"Error evaluating insect risks: {e}")
@@ -325,14 +371,17 @@ def evaluate_disease_risks(weather_data, phenophase, date):
     alerts = []
 
     try:
-        if weather_data.empty:
+        weather_row = weather_data[weather_data['date'].dt.date == date]
+        if weather_row.empty:
             logging.warning("No weather data for disease risk evaluation.")
             return alerts
 
-        tmax = weather_data[weather_data['date'].dt.date == date]['tmax'].iloc[0] if 'tmax' in weather_data and not weather_data.empty else None
-        humidity = weather_data[weather_data['date'].dt.date == date]['humidity'].iloc[0] if 'humidity' in weather_data and not weather_data.empty else None
-        rain_prob = weather_data[weather_data['date'].dt.date == date]['rain_prob'].iloc[0] if 'rain_prob' in weather_data and not weather_data.empty else None
-        rainy_days = calculate_rainy_days(weather_data, date) if 'precipitation' in weather_data else 0
+        tmax = weather_row['tmax'].iloc[0] if 'tmax' in weather_row and pd.notnull(weather_row['tmax'].iloc[0]) else None
+        tmin = weather_row['tmin'].iloc[0] if 'tmin' in weather_row and pd.notnull(weather_row['tmin'].iloc[0]) else None
+        humidity = weather_row['humidity'].iloc[0] if 'humidity' in weather_row and pd.notnull(weather_row['humidity'].iloc[0]) else None
+        sunshine_hours = weather_row['sunshine_hours'].iloc[0] if 'sunshine_hours' in weather_row and pd.notnull(weather_row['sunshine_hours'].iloc[0]) else None
+        rain_prob = weather_row['rain_prob'].iloc[0] if 'rain_prob' in weather_row and pd.notnull(weather_row['rain_prob'].iloc[0]) else None
+        rainy_days = calculate_rainy_days(weather_data, date)
 
         for disease in disease_risks:
             if phenophase not in disease["phenophases"]:
@@ -352,7 +401,7 @@ def evaluate_disease_risks(weather_data, phenophase, date):
                 elif param == "rain_probability" and rain_prob is not None:
                     if cond["range"][0] <= rain_prob <= cond["range"][1]:
                         score += weight
-                elif param == "rainy_days" and rainy_days is not None:
+                elif param == "rainy_days":
                     if rainy_days >= cond["value"]:
                         score += weight
 
@@ -363,87 +412,115 @@ def evaluate_disease_risks(weather_data, phenophase, date):
                     "risk_percentage": risk_percentage,
                     "advisory": disease["advisory"]
                 })
-
         return alerts
     except Exception as e:
         logging.error(f"Error evaluating disease risks: {e}")
         return alerts
 
-# --- Update GDD and Related Metrics ---
+# --- Determine Sowing Window ---
+def determine_sowing_window(sowing_date):
+    month = sowing_date.month
+    day = sowing_date.day
+    if month == 5:
+        if 20 <= day <= 23:
+            return "May 20–23"
+        elif 24 <= day <= 27:
+            return "May 24–27"
+        elif 28 <= day <= 31:
+            return "May 28–31"
+    elif month == 6:
+        if 1 <= day <= 4:
+            return "June 1–4"
+        elif 5 <= day <= 8:
+            return "June 5–8"
+        elif 9 <= day <= 12:
+            return "June 9–12"
+        elif 13 <= day <= 16:
+            return "June 13–16"
+        elif 17 <= day <= 20:
+            return "June 17–20"
+        elif 21 <= day <= 24:
+            return "June 21–24"
+        elif 25 <= day <= 28:
+            return "June 25–28"
+        elif 29 <= day <= 30:
+            return "June 29–July 2"
+    elif month == 7:
+        if 1 <= day <= 2:
+            return "June 29–July 2"
+        elif 3 <= day <= 6:
+            return "July 3–6"
+        elif 7 <= day <= 10:
+            return "July 7–10"
+        elif 11 <= day <= 14:
+            return "July 11–14"
+        elif day == 15:
+            return "July 15"
+    return None
+
+# --- Get Current Phenophase ---
+def get_current_phenophase(cumulative_gdd, sowing_date):
+    sowing_window = determine_sowing_window(sowing_date)
+    if not sowing_window:
+        return None, None
+    thresholds = phenophase_thresholds[sowing_window]
+    current_phenophase = "P0"  # Before emergence
+    for phenophase, (min_gdd, max_gdd) in sorted(thresholds.items(), key=lambda x: x[1][0], reverse=True):
+        if cumulative_gdd >= min_gdd:
+            return phenophase, phenophase_descriptions[phenophase]
+    return current_phenophase, "Pre-emergence"
+
+# --- Update GDD and Track Phenophases ---
 def update_gdd(sowing_date, question_date, p4_gdd_threshold, grid_id, sowing_window):
     try:
-        weather_data = fetch_weather_data(sowing_date, question_date, grid_id)
+        end_date = question_date + timedelta(days=90)  # Fetch extra data for projections if needed
+        weather_data = fetch_weather_data(sowing_date, end_date, grid_id)
         if weather_data.empty:
-            return 0, None, 0, 0, None, weather_data, {key: None for key in phenophase_thresholds[sowing_window]}
+            return 0, None, 0, 0, None, weather_data, {p: None for p in phenophase_descriptions}
 
         cumulative_gdd = 0
         pbw_gdd = 0
         p4_start_date = None
-        phenophase_dates = {key: None for key in phenophase_thresholds[sowing_window]}
         total_rainfall = 0
-        temp_sum = 0
-        temp_count = 0
+        phenophase_dates = {p: None for p in phenophase_descriptions}
+        thresholds = phenophase_thresholds[sowing_window]
 
         for _, row in weather_data.iterrows():
             current_date = row['date'].date()
+            if current_date < sowing_date:
+                continue
+            if current_date > question_date:
+                break
+
             daily_gdd = calculate_gdd(row['tmax'], row['tmin'])
             cumulative_gdd += daily_gdd
-            pbw_gdd += daily_gdd  # Simplified PBW GDD accumulation
-            total_rainfall += row['precipitation'] if pd.notnull(row['precipitation']) else 0
-            if pd.notnull(row['tmax']) and pd.notnull(row['tmin']):
-                temp_sum += (row['tmax'] + row['tmin']) / 2
-                temp_count += 1
+            total_rainfall += row['precipitation']
 
-            phenophase, _ = get_current_phenophase(cumulative_gdd, sowing_date)
-            if phenophase and phenophase_dates[phenophase] is None:
-                phenophase_dates[phenophase] = current_date
-            if cumulative_gdd >= p4_gdd_threshold and p4_start_date is None:
+            # Track phenophase start dates
+            for phenophase, (min_gdd, _) in thresholds.items():
+                if phenophase_dates[phenophase] is None and cumulative_gdd >= min_gdd:
+                    phenophase_dates[phenophase] = current_date
+
+            # PBW GDD starts from P4
+            if p4_start_date is None and cumulative_gdd >= p4_gdd_threshold:
                 p4_start_date = current_date
+            if p4_start_date and current_date >= p4_start_date:
+                pbw_gdd += daily_gdd
 
-        avg_temp = temp_sum / temp_count if temp_count > 0 else None
+        avg_temp = (weather_data[weather_data['date'].dt.date == question_date]['tmax'].iloc[0] +
+                    weather_data[weather_data['date'].dt.date == question_date]['tmin'].iloc[0]) / 2 if not weather_data.empty else None
+
         return cumulative_gdd, p4_start_date, pbw_gdd, total_rainfall, avg_temp, weather_data, phenophase_dates
     except Exception as e:
         logging.error(f"Error updating GDD: {e}")
-        return 0, None, 0, 0, None, pd.DataFrame(), {key: None for key in phenophase_thresholds[sowing_window]}
-
-# --- Determine Sowing Window ---
-def determine_sowing_window(sowing_date):
-    try:
-        sowing_month = sowing_date.month
-        sowing_day = sowing_date.day
-        if 5 <= sowing_month <= 7:
-            for window in phenophase_thresholds.keys():
-                start_day, end_day = map(int, window.split('–'))
-                start_month, end_month = 5, 7  # Adjust based on window definition
-                if (sowing_month == start_month and sowing_day >= start_day) or (sowing_month == end_month and sowing_day <= end_day):
-                    return window
-        return None
-    except Exception as e:
-        logging.error(f"Error determining sowing window: {e}")
-        return None
-
-# --- Get Current Phenophase ---
-def get_current_phenophase(cumulative_gdd, sowing_date):
-    try:
-        sowing_window = determine_sowing_window(sowing_date)
-        if not sowing_window or sowing_window not in phenophase_thresholds:
-            return None, None
-
-        thresholds = phenophase_thresholds[sowing_window]
-        for phase, (min_gdd, max_gdd) in sorted(thresholds.items(), key=lambda x: x[1][0]):
-            if min_gdd <= cumulative_gdd <= max_gdd:
-                return phase, phenophase_descriptions.get(phase, "Unknown")
-        return None, None
-    except Exception as e:
-        logging.error(f"Error getting current phenophase: {e}")
-        return None, None
+        return 0, None, 0, 0, None, pd.DataFrame(), {p: None for p in phenophase_descriptions}
 
 # --- Calculate Historical Insect Risks ---
 def calculate_historical_insect_risks(sowing_date, end_date, grid_id, p4_start_date, pbw_gdd, risk_threshold=40):
     try:
         weather_data = fetch_weather_data(sowing_date, end_date, grid_id)
         if weather_data.empty:
-            logging.warning(f"No weather data for historical insect risk calculation from {sowing_date} to {end_date}")
+            logging.warning(f"No weather data for historical insect risk calculation from {sowing_date} to {end_date}.")
             return f"No historical insect risks with risk score >= {risk_threshold} detected since sowing."
 
         insect_risk_days = {}
@@ -459,10 +536,11 @@ def calculate_historical_insect_risks(sowing_date, end_date, grid_id, p4_start_d
             daily_gdd = calculate_gdd(row['tmax'], row['tmin'])
             cumulative_gdd += daily_gdd
             phenophase, _ = get_current_phenophase(cumulative_gdd, sowing_date)
+            weather_row = weather_data[weather_data['date'].dt.date == current_date]
+
             if phenophase:
-                weather_row = weather_data[weather_data['date'].dt.date == current_date]
-                insect_alerts = evaluate_insect_risks(weather_row, phenophase, current_date)
-                for alert in insect_alerts:
+                alerts = evaluate_insect_risks(weather_row, phenophase, current_date)
+                for alert in alerts:
                     if alert['risk_percentage'] >= risk_threshold:
                         insect_name = alert['insect']
                         if insect_name not in insect_risk_days:
@@ -471,21 +549,23 @@ def calculate_historical_insect_risks(sowing_date, end_date, grid_id, p4_start_d
                             insect_max_risks[insect_name] = alert['risk_percentage']
                             insect_max_risk_dates[insect_name] = current_date
                         insect_risk_days[insect_name] += 1
-                        if alert['risk_percentage'] > insect_max_risks.get(insect_name, 0):
+                        if alert['risk_percentage'] > insect_max_risks[insect_name]:
                             insect_max_risks[insect_name] = alert['risk_percentage']
                             insect_max_risk_dates[insect_name] = current_date
-                pbw_risk = evaluate_pbw_risk(pbw_gdd, phenophase, weather_row, current_date)
-                if pbw_risk['risk_percentage'] >= risk_threshold:
-                    insect_name = "Pink Boll Worm"
-                    if insect_name not in insect_risk_days:
-                        insect_risk_days[insect_name] = 0
-                        insect_first_dates[insect_name] = current_date
-                        insect_max_risks[insect_name] = pbw_risk['risk_percentage']
-                        insect_max_risk_dates[insect_name] = current_date
-                    insect_risk_days[insect_name] += 1
-                    if pbw_risk['risk_percentage'] > insect_max_risks.get(insect_name, 0):
-                        insect_max_risks[insect_name] = pbw_risk['risk_percentage']
-                        insect_max_risk_dates[insect_name] = current_date
+
+                if p4_start_date and current_date >= p4_start_date:
+                    pbw_risk = evaluate_pbw_risk(pbw_gdd, phenophase, weather_row, current_date)
+                    if pbw_risk['risk_percentage'] >= risk_threshold:
+                        insect_name = "Pink Boll Worm"
+                        if insect_name not in insect_risk_days:
+                            insect_risk_days[insect_name] = 0
+                            insect_first_dates[insect_name] = current_date
+                            insect_max_risks[insect_name] = pbw_risk['risk_percentage']
+                            insect_max_risk_dates[insect_name] = current_date
+                        insect_risk_days[insect_name] += 1
+                        if pbw_risk['risk_percentage'] > insect_max_risks.get(insect_name, 0):
+                            insect_max_risks[insect_name] = pbw_risk['risk_percentage']
+                            insect_max_risk_dates[insect_name] = current_date
 
         if not insect_risk_days:
             return f"No historical insect risks with risk score >= {risk_threshold} detected since sowing."
@@ -506,7 +586,7 @@ def calculate_historical_disease_risks(sowing_date, end_date, grid_id, risk_thre
     try:
         weather_data = fetch_weather_data(sowing_date, end_date, grid_id)
         if weather_data.empty:
-            logging.warning(f"No weather data for historical disease risk calculation from {sowing_date} to {end_date}")
+            logging.warning(f"No weather data for historical disease risk calculation from {sowing_date} to {end_date}.")
             return f"No historical disease risks with risk score >= {risk_threshold} detected since sowing."
 
         disease_risk_days = {}
@@ -681,10 +761,13 @@ def process_location(sowing_date, question_date, lat, lon, grid_id, farmer_id, f
         return f"Error processing grid_id={grid_id}: {e}"
 
 # --- Interactive Input Handler ---
+# --- Interactive Input Handler ---
+# --- Interactive Input Handler ---
 def get_user_inputs():
     def valid_date(s):
+        # Check if the input is already a datetime.date object
         from datetime import datetime, date
-        if isinstance(s, date):
+        if isinstance(s, date):  # Use date directly from datetime module
             return s
         try:
             return datetime.strptime(s, "%Y-%m-%d").date()
@@ -733,6 +816,7 @@ def get_user_inputs():
     lon = df['longitude'].iloc[0]
     sowing_date = df['sowing_date'].iloc[0]
 
+    # Handle sowing_date
     try:
         sowing_date = valid_date(sowing_date)
     except ValueError as e:
