@@ -1,31 +1,30 @@
 import os
+import argparse
 import pandas as pd
 import logging
-import argparse
 from urllib.parse import quote_plus
-
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
+import datetime
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-load_dotenv()  # loads .env into os.environ (no-op if .env not present)
+# --- Logging Setup ---
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-
+# --- Load Environment Variables ---
+load_dotenv()
 
 def get_db_url() -> str | None:
     """
     Return DB URL from DB_URL or build from DB_USER/DB_PASS/DB_HOST/DB_PORT/DB_NAME.
-    If password contains special chars it URL-encodes it.
+    If password contains special chars, it URL-encodes it.
     """
     db_url = os.getenv("DB_URL")
     if db_url:
         return db_url
 
-    # fallback to components (useful if you prefer separate env vars)
     user = os.getenv("DB_USER")
     pwd = os.getenv("DB_PASS")
     host = os.getenv("DB_HOST", "localhost")
@@ -37,13 +36,13 @@ def get_db_url() -> str | None:
         logging.error("DB_URL not set and/or DB_USER/DB_PASS/DB_NAME are missing.")
         return None
 
-    pwd_quoted = quote_plus(pwd)  # encodes special chars in password
+    pwd_quoted = quote_plus(pwd)  # Encodes special chars in password
     return f"{driver}://{user}:{pwd_quoted}@{host}:{port}/{name}"
-
 
 def mask_db_url(url: str) -> str:
     """Return a safe-to-log version of a DB URL with password masked."""
     try:
+        from sqlalchemy.engine.url import make_url
         u = make_url(url)
         user = u.username or "?"
         host = u.host or "?"
@@ -52,11 +51,9 @@ def mask_db_url(url: str) -> str:
         driver = u.drivername or "?"
         return f"{driver}://{user}:***@{host}:{port}/{database}"
     except Exception:
-        # fallback if parsing fails
         return "masked_db_url"
 
-
-def setup_database() -> Engine:
+def setup_database():
     db_url = get_db_url()
     if not db_url:
         logging.error("No DB URL available. Set DB_URL or DB_USER/DB_PASS/DB_NAME in env.")
@@ -65,7 +62,6 @@ def setup_database() -> Engine:
     logging.debug(f"Connecting using: {mask_db_url(db_url)}")
     try:
         engine = create_engine(db_url, pool_pre_ping=True)
-        # quick test connection
         with engine.connect() as conn:
             logging.info("Database connected successfully.")
         return engine
